@@ -1,44 +1,62 @@
 
 import gradio as gr
 import os
-from main import query_router, handle_meta_query, rag_chain
+from main import query_router, handle_meta_query, handle_greeting, rag_chain
 
 def research_assistant(question):
     """
     this function is the core logic that Gradio will call.
     It takes a user question and returns the formatted answer.
     """
+    try:
+        # Route the question to the appropriate tool
+        route = query_router(question)
+        print(f"Debug: route = {route}, question = {question}")
 
-    # Route the question to the appropriate tool
-    route = query_router(question)
-
-    if route == 'meta_query':
-        return handle_meta_query(question)
-    
-    elif route == 'rag_query':
-        result = rag_chain.invoke(question)
-        answer = result["answer"]
-
-        # process and format the sources
-        source_documents = result["documents"]
-        unique_sources = {}
-        for doc in source_documents:
-            source_file = os.path.basename(doc.metadata.get("source", "Unknown Source"))
-            if source_file not in unique_sources:
-                display_name = doc.metadata.get("title", source_file)
-                if not display_name:
-                    display_name = source_file
-                unique_sources[source_file] = display_name
+        if route == 'greet':
+            result = handle_greeting(question)
+            print(f"Debug: greeting result = {type(result)}: {result}")
+            return str(result)
         
-        # Only append sources if the answer seems to be using the research documents
-        # (i.e., not just a casual greeting or general conversation)
-        if unique_sources and any(keyword in question.lower() for keyword in 
-                                ['agent', 'reinforcement', 'learning', 'multi-agent', 'algorithm', 'training', 'reward']):
-            answer += "\n\n**Sources:**\n"
-            for display_name in sorted(unique_sources.values()):
-                answer += f"- {display_name}\n"
+        elif route == 'meta_query':
+            result = handle_meta_query(question)
+            print(f"Debug: meta result = {type(result)}: {result}")
+            return str(result)
+        
+        elif route == 'rag_query':
+            result = rag_chain.invoke(question)
+            answer = result["answer"]
+            print(f"Debug: rag answer = {type(answer)}: {answer}")
 
-        return answer
+            # process and format the sources
+            source_documents = result["documents"]
+            unique_sources = {}
+            for doc in source_documents:
+                source_file = os.path.basename(doc.metadata.get("source", "Unknown Source"))
+                if source_file not in unique_sources:
+                    display_name = doc.metadata.get("title", source_file)
+                    if not display_name:
+                        display_name = source_file
+                    unique_sources[source_file] = display_name
+            
+            # Only append sources if the answer seems to be using the research documents
+            # (i.e., not just a casual greeting or general conversation)
+            if unique_sources and any(keyword in question.lower() for keyword in 
+                                    ['agent', 'reinforcement', 'learning', 'multi-agent', 'algorithm', 'training', 'reward']):
+                answer += "\n\n**Sources:**\n"
+                for display_name in sorted(unique_sources.values()):
+                    answer += f"- {display_name}\n"
+
+            return str(answer)
+        
+        else:
+            # Fallback for unknown routes
+            print(f"Debug: Unknown route '{route}', falling back")
+            return f"I'm not sure how to handle that type of question: {question}"
+            
+    except Exception as e:
+        print(f"Debug: Exception in research_assistant: {e}")
+        return f"I encountered an error processing your question: {str(e)}"
 
 # Build the Gradio Interface
 iface = gr.Interface(

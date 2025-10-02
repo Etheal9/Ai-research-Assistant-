@@ -1,6 +1,9 @@
-
 import re
 import PyPDF2
+import os
+import json
+import time
+import hashlib
 from langchain_community.document_loaders import DirectoryLoader, PyPDFLoader
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_community.embeddings import HuggingFaceEmbeddings
@@ -8,83 +11,78 @@ from langchain_community.vectorstores import FAISS
 
 DATA_PATH = "papers/"
 DB_FAISS_PATH = "vectorstore/db_faiss"
+METADATA_PATH = "vectorstore/metadata.json"
+
+# Embedding model name used for this ingest run (bump when you change model)
+EMBEDDING_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
 
 # 1. Clean the text from PDF artifacts
 def clean_text(text):
-    text = re.sub(r'^(.*?)\s+\d+\s*$', '', text, flags=re.MULTILINE)
-    text = re.sub(r'\[\d+\]', '', text)
-    text = re.sub(r'^\s*[a-zA-Z]\s*$', '', text, flags=re.MULTILINE)
-    text = re.sub(r'\n\s*\n', '\n', text)
-    return text
+    if not text:
+        return text
+    text = re.sub(r'\[\s*\d+(?:[,\s\d]*)\s*\]', '', text)
+    text = re.sub(r'(?m)^[A-Za-z]\s*$', '', text)
+    text = re.sub(r'\n\s*\n+', '\n\n', text)
+    return text.strip()
 
-# 2. Deduplicate chunks by content hash
+# 2. Deduplicate chunks by content hash (stable)
 def deduplicate_chunks(chunks):
     seen = set()
     unique_chunks = []
     for chunk in chunks:
-        content_hash = hash(chunk.page_content)
-        if content_hash not in seen:
-            seen.add(content_hash)
+        content = getattr(chunk, "page_content", "") or ""
+        h = hashlib.sha256(content.encode("utf-8")).hexdigest()
+        if h not in seen:
+            seen.add(h)
             unique_chunks.append(chunk)
     return unique_chunks
 
 def extract_pdf_metadata(pdf_path):
-    """Extracts title and author from PDF content (first page)."""
     try:
         with open(pdf_path, "rb") as f:
             reader = PyPDF2.PdfReader(f)
-            
-            # First try to get metadata from PDF info
             info = reader.metadata
-            title = info.title if info.title else ""
-            author = info.author if info.author else ""
-            
-            # If title is missing, extract from first page content
+            title = info.title if info and getattr(info, "title", None) else ""
+            author = info.author if info and getattr(info, "author", None) else ""
             if not title and len(reader.pages) > 0:
                 first_page = reader.pages[0]
-                page_text = first_page.extract_text()
-                
-                # Extract title using pattern matching
-                # Look for lines that appear to be titles (centered, bold, etc.)
+                page_text = first_page.extract_text() or ""
                 lines = page_text.split('\n')
-                
-                # Common title patterns in academic papers:
-                # 1. Lines that are not too long (3-15 words)
-                # 2. Lines that don't start with numbers or special chars
-                # 3. Lines that are followed by author names
-                
                 for i, line in enumerate(lines):
                     line = line.strip()
-                    words = line.split()
-                    
-                    # Skip empty lines, page numbers, headers/footers
-                    if (not line or
-                        len(words) < 2 or
-                        len(words) > 20 or
-                        line.isdigit() or
-                        any(word.lower() in ['abstract', 'introduction', 'proceedings'] for word in words) or
-                        any(char in line for char in ['©', '§', '•']) or
-                        re.match(r'^\d+$', line) or  # Page numbers
-                        re.match(r'^[A-Z\s]+$', line)):  # ALL CAPS headers
+                    if not line:
                         continue
-                    
-                    # This might be a title candidate
+                    words = line.split()
+                    if len(words) < 2 or len(words) > 20:
+                        continue
+                    if re.search(r'^(abstract|introduction|references)$', line.strip().lower()):
+                        continue
                     title = line
-                    
-                    # Check if next line might be authors
                     if i + 1 < len(lines):
                         next_line = lines[i + 1].strip()
-                        if (len(next_line.split()) <= 8 and
-                            any(word.lower() in ['university', 'department', 'laboratory', 'institute'] for word in next_line.split()) or
-                            re.search(r'@|\.edu|\.ac\.', next_line)):
+                        if re.search(r'@|\.edu|\.ac\.', next_line) or any(w.lower() in next_line.lower() for w in ['university','institute','department']):
                             author = next_line
-                    
-                    break  # Found a candidate, break early
-            
+                    break
             return {"title": title, "author": author}
     except Exception as e:
         print(f"Could not extract metadata from {pdf_path}: {e}")
         return {"title": "", "author": ""}
+
+# metadata helpers
+def save_index_metadata(path, model_name, chunk_count):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    payload = {"embedding_model": model_name, "created_at": int(time.time()), "chunk_count": chunk_count}
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2)
+
+def load_index_metadata(path):
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return None
 
 # Load documents
 print("Loading documents...")
@@ -92,12 +90,7 @@ loader = DirectoryLoader(DATA_PATH, glob='*.pdf', loader_cls=PyPDFLoader)
 documents = loader.load()
 print(f"Loaded {len(documents)} documents.")
 
-# 3. Extract and print metadata for each document
-print("Extracting and displaying metadata for each document...")
-for doc in documents:
-    print(f"Document metadata: {doc.metadata}")
-
-    # After loading documents, enrich their metadata
+# Extract and display metadata
 print("Extracting detailed PDF metadata (title, author)...")
 for doc in documents:
     source_path = doc.metadata.get("source", None)
@@ -117,27 +110,39 @@ text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=15
 text_chunks = text_splitter.split_documents(documents)
 print(f"Split documents into {len(text_chunks)} chunks.")
 
-# 4. Assign metadata to each chunk (already handled by LangChain split_documents)
-# But you can enrich or check metadata here if needed
+# Quick debug: how many chunks actually contain useful text?
+non_empty = [c for c in text_chunks if c.page_content and c.page_content.strip()]
+print(f"{len(non_empty)} non-empty chunks (out of {len(text_chunks)})")
+if non_empty:
+    print("Sample chunk preview:")
+    print(non_empty[0].page_content[:400].replace('\\n', ' ') + "...")
+
+# Ensure chunk metadata has source
 for chunk in text_chunks:
-    # Example: Add a custom field if missing
     if 'source' not in chunk.metadata:
         chunk.metadata['source'] = 'unknown'
 
-# 5. Deduplicate chunks
+# Deduplicate
 print("Deduplicating chunks...")
-text_chunks = deduplicate_chunks(text_chunks)
+text_chunks = deduplicate_chunks(non_empty)
 print(f"{len(text_chunks)} unique chunks after deduplication.")
 
 # Create embeddings
 print("Creating embeddings...")
-embeddings = HuggingFaceEmbeddings(
-    model_name='sentence-transformers/all-MiniLM-L6-v2',
-    model_kwargs={'device': 'cpu'}
-)
+embeddings = HuggingFaceEmbeddings(model_name=EMBEDDING_MODEL_NAME, model_kwargs={'device': 'cpu'})
 
-# 6. Store original text + metadata with vectors (handled by FAISS.from_documents)
+# warn on existing meta mismatch
+existing_meta = load_index_metadata(METADATA_PATH)
+if existing_meta and existing_meta.get("embedding_model") != EMBEDDING_MODEL_NAME:
+    print("WARNING: existing index metadata indicates a different embedding model was used:")
+    print(f"  existing: {existing_meta.get('embedding_model')}")
+    print(f"  current:  {EMBEDDING_MODEL_NAME}")
+    print("Vectors are not compatible across embedding models. Rebuilding the index is recommended.")
+
+# Create and save
+os.makedirs(os.path.dirname(DB_FAISS_PATH), exist_ok=True)
 print("Creating and saving the vector store...")
 db = FAISS.from_documents(text_chunks, embeddings)
 db.save_local(DB_FAISS_PATH)
+save_index_metadata(METADATA_PATH, EMBEDDING_MODEL_NAME, len(text_chunks))
 print("Vector store rebuilt successfully with cleaned data and metadata.")

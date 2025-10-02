@@ -1,185 +1,227 @@
 import os
+import logging
+from pathlib import Path
 from dotenv import load_dotenv
 from langchain_core.prompts import PromptTemplate
-from langchain_core.runnables import RunnablePassthrough
-from langchain_core.output_parsers import StrOutputParser
 from langchain_community.vectorstores import FAISS
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_groq import ChatGroq
 
-# Load environment variables
+# Load environment and basic logging
 load_dotenv()
+logging.basicConfig(level=logging.INFO)
 
-# --- SETUP AND LOAD KNOWLEDGE BASE ---
+# --- CONFIG ---
 DB_FAISS_PATH = "vectorstore/db_faiss"
+PROMPT_PATH = Path("prompts/rag_prompt.txt")
 
-# Initialize LLM and Embeddings
+# Initialize LLM and Embeddings (keep consistent with ingest.py)
 llm = ChatGroq(temperature=0, model_name="llama-3.1-8b-instant")
-embeddings = HuggingFaceEmbeddings(model_name='sentence-transformers/all-MiniLM-L6-v2', model_kwargs={'device': 'cpu'})
+embeddings = HuggingFaceEmbeddings(
+    model_name="sentence-transformers/all-MiniLM-L6-v2",
+    model_kwargs={"device": "cpu"},
+)
 
-# Load the vector store from disk
-db = FAISS.load_local(DB_FAISS_PATH, embeddings, allow_dangerous_deserialization=True)
-retriever = db.as_retriever(search_kwargs={'k': 5}) # Increased k for a larger KB
+# Safe DB load
+try:
+    db = FAISS.load_local(DB_FAISS_PATH, embeddings, allow_dangerous_deserialization=True)
+    logging.info("Loaded FAISS vector store from %s", DB_FAISS_PATH)
+except Exception as e:
+    logging.warning("Failed to load FAISS index at %s: %s", DB_FAISS_PATH, e)
+    db = None
 
-# --- **IMPROVED**: DYNAMICALLY GET ALL SOURCE DOCUMENT TITLES ---
-# This function reads all the metadata from the vector store to create a comprehensive,
-# up-to-date list of all the source documents with their proper titles.
-def get_source_document_list(db):
-    print("Extracting document information from knowledge base...")
-    
-    # Get all documents from the vector store
-    all_docs = db.docstore._dict.values()
-    unique_sources = {} # Use a dictionary to handle duplicates by source file
-    
-    for doc in all_docs:
-        # Get the source filename
-        source_path = doc.metadata.get("source", "Unknown")
-        source_file = os.path.basename(source_path)
-        
-        # Try to get the title from metadata, prefer 'title' field
-        title = doc.metadata.get("title", "")
-        
-        # If no title in metadata, try to extract from content or use filename
-        if not title or title.strip() == "":
-            # Use filename without extension as fallback
-            title = os.path.splitext(source_file)[0]
-        
-        # Store with source file as key to avoid duplicates
-        if source_file not in unique_sources or len(title) > len(unique_sources[source_file]):
-            unique_sources[source_file] = title.strip()
-    
-    print(f"Found {len(unique_sources)} unique documents in the knowledge base.")
-    
-    # Return sorted list of titles
+retriever = db.as_retriever(search_kwargs={"k": 5}) if db else None
+
+# Get source docs safely
+def get_source_document_list(db_obj):
+    if not db_obj:
+        return []
+    values = []
+    try:
+        docstore = getattr(db_obj, "docstore", None)
+        if docstore and hasattr(docstore, "_dict"):
+            values = list(docstore._dict.values())
+        else:
+            # try iterate stored docs if public API exists
+            if hasattr(db_obj, "get_all_documents"):
+                values = list(db_obj.get_all_documents())
+    except Exception:
+        values = []
+
+    unique_sources = {}
+    for doc in values:
+        try:
+            src = doc.metadata.get("source", "Unknown")
+            src_file = os.path.basename(src)
+            title = doc.metadata.get("title", "") or os.path.splitext(src_file)[0]
+            unique_sources[src_file] = title.strip()
+        except Exception:
+            continue
     return sorted(list(unique_sources.values()))
 
-# Create the dynamic list of source documents
 SOURCE_DOCUMENTS = get_source_document_list(db)
 
-# --- RAG CHAIN (For Domain-Specific Questions) ---
+# Load RAG prompt from external file (single responsibility)
+if PROMPT_PATH.exists():
+    rag_prompt_text = PROMPT_PATH.read_text(encoding="utf-8")
+else:
+    logging.error("Prompt file missing at %s", PROMPT_PATH)
+    rag_prompt_text = "Context:\n{context}\n\nQuestion:\n{question}\n\nAnswer:"
+
+rag_prompt = PromptTemplate(template=rag_prompt_text, input_variables=["context", "question"])
+
+# Helper: format docs into context
 def format_docs(docs):
-    """Converts a list of Document objects into a single string."""
-    return "\n\n".join(doc.page_content for doc in docs)
+    if not docs:
+        return ""
+    parts = []
+    for d in docs:
+        content = getattr(d, "page_content", "") or ""
+        src = d.metadata.get("source", "")
+        title = d.metadata.get("title", "")
+        header = f"Source: {os.path.basename(src)} | Title: {title}".strip()
+        parts.append(header + "\n\n" + content)
+    return "\n\n---\n\n".join(parts)
 
-rag_prompt_template = """
+# Greeting handler
+def handle_greeting(_question):
+    return "Hello — I'm an assistant over a corpus of research on Multi-Agent AI Systems. Ask me about the papers or request a list of available documents."
 
-You are a helpful AI assistant with expertise in Multi-Agent AI Systems. You have access to research documents on this topic.
-
-If the user's question is related to research documents you have, Multi-Agent AI Systems, Reinforcement Learning, or Generative Agents, use the provided context to give a comprehensive answer. If the context contains relevant information, prioritize it in your response.
-
-If the question is a general greeting, casual conversation, or unrelated to your expertise area, respond naturally and helpfully as a friendly AI assistant that you can not answer out of the unrelated to your expertise area.
-
-use a Funnel‑style Chain of Thought when answering.
-This means:
-
-1. Start broad by introducing the general topic.
-2. Narrow down into sub‑topics step by step, each building on the previous.
-3. Highlight key details and examples at each stage.
-4. Conclude with a clear synthesis and 2–3 practical takeaways.
-
-Never jump straight into specifics without context.
-If the user asks a complex question, break it into smaller reasoning steps before answering.
-Keep your tone professional but approachable, and explain technical terms with analogies when possible.
-
-Context: {context}
-Question: {question}
-
-Helpful Answer:
-"""
-
-
-# **NEW**: Simplified and corrected RAG chain
-# First convert string input to dictionary, then process
-def string_to_dict(question):
-    """Convert string question to dictionary format."""
-    return {"question": question}
-
-# Define the PromptTemplate for the RAG prompt
-rag_prompt = PromptTemplate(
-    template=rag_prompt_template,
-    input_variables=["context", "question"]
-)
-
-rag_chain = (
-    string_to_dict
-    | RunnablePassthrough.assign(documents=lambda x: retriever.invoke(x["question"]))
-    | RunnablePassthrough.assign(
-        answer=(
-            RunnablePassthrough.assign(context=lambda x: format_docs(x["documents"]))
-            | rag_prompt
-            | llm
-            | StrOutputParser()
-        )
-    )
-)
-
-# --- ROUTER AND META-QUERY HANDLER ---
-def handle_meta_query(question):
-    """Answers questions about the knowledge base using the dynamic list of sources."""
-    response = f"I have access to {len(SOURCE_DOCUMENTS)} research papers on Multi-Agent AI Systems, Reinforcement Learning, and Generative Agents. Here are all the documents in my knowledge base:\n\n"
-    
-    # Add each document with proper formatting
-    for i, doc_title in enumerate(sorted(SOURCE_DOCUMENTS), 1):
-        response += f"{i}. {doc_title}\n"
-    
-    response += f"\nYou can ask me questions about any of these papers or topics related to Multi-Agent AI Systems!"
+# Meta handler
+def handle_meta_query(_question):
+    response = f"I have access to {len(SOURCE_DOCUMENTS)} research papers. Here are the documents in my knowledge base:\n\n"
+    for i, title in enumerate(sorted(SOURCE_DOCUMENTS), 1):
+        response += f"{i}. {title}\n"
+    response += "\nYou can ask me questions about any of these papers."
     return response
 
+# RAG answer flow (explicit retrieval + LLM call)
+def answer_rag_question(question):
+    if retriever is None:
+        return "I don't have document context available right now.", []
+
+    try:
+        docs = retriever.get_relevant_documents(question)
+    except Exception as e:
+        logging.error("Retriever failed: %s", e)
+        return "I could not retrieve documents right now.", []
+
+    logging.info("Retrieved %d documents for query.", len(docs))
+    if not docs:
+        return "I'm sorry — the information does not appear in the available documents.", []
+
+    # debug preview
+    try:
+        preview = docs[0].page_content[:300].replace("\n", " ")
+        logging.debug("Preview: %s", preview)
+    except Exception:
+        pass
+
+    context = format_docs(docs)
+    prompt_text = rag_prompt.format(context=context, question=question)
+
+    # Try multiple LLM invocation patterns defensively
+    raw = None
+    try:
+        raw = llm.invoke(prompt_text)
+    except Exception:
+        try:
+            gen = llm.generate([prompt_text])
+            raw = gen
+        except Exception as e:
+            logging.error("LLM invocation failed: %s", e)
+            return "I could not generate an answer right now.", docs
+
+    # Normalize result robustly (handle str, BaseMessage/AIMessage, .text() method, and generation objects)
+    answer = None
+    if isinstance(raw, str):
+        answer = raw.strip()
+    else:
+        # 1) common chat message: use .content if present
+        content = getattr(raw, "content", None)
+        if isinstance(content, str) and content.strip():
+            answer = content.strip()
+        else:
+            # 2) .text may be a method or attribute
+            text_attr = getattr(raw, "text", None)
+            if callable(text_attr):
+                try:
+                    answer = str(text_attr()).strip()
+                except Exception:
+                    answer = None
+            elif isinstance(text_attr, str) and text_attr.strip():
+                answer = text_attr.strip()
+            else:
+                # 3) generation-like object
+                gens = getattr(raw, "generations", None)
+                if gens:
+                    try:
+                        answer = gens[0][0].text.strip()
+                    except Exception:
+                        answer = None
+                # 4) fallback to str()
+                if not answer:
+                    answer = str(raw).strip()
+
+    return answer, docs
+
+# Chain-like interface for compatibility with other code
+class RagChain:
+    def invoke(self, question):
+        ans, docs = answer_rag_question(question)
+        return {"answer": ans, "documents": docs}
+
+rag_chain = RagChain()
+
+# Router with greeting detection and meta detection
 def query_router(question):
-    """Classifies a user's question to decide which tool to use."""
-    question_lower = question.lower()
-    
-    # Expanded keywords for meta-queries about the knowledge base and resources
-    meta_keywords = [
-        "what documents", "what papers", "list your sources", "what are your sources",
-        "what resources", "list resources", "what pdfs", "list pdfs", 
-        "show me your papers", "show me documents", "what research papers",
-        "list papers", "list documents", "show sources", "available papers",
-        "available documents", "what data", "your knowledge base", "knowledge base",
-        "bibliography", "references", "what studies", "research sources",
-        "show me your sources", "list all sources", "all sources", "your sources",
-        "show all documents", "show all papers", "list all papers", "list all documents",
-        "what do you have", "sources you have", "papers you have", "documents you have"
-    ]
-    
-    # Check for direct meta-questions
-    if any(keyword in question_lower for keyword in meta_keywords):
+    q = (question or "").lower().strip()
+    greetings = ["hi", "hello", "hey", "good morning", "good afternoon", "good evening"]
+    if any(q == g or q.startswith(g + " ") for g in greetings):
+        return "greet"
+    meta_keywords = ["what documents", "what papers", "list your sources", "what are your sources", "what resources", "your knowledge base", "list papers"]
+    if any(k in q for k in meta_keywords):
         return "meta_query"
-    
-    # For everything else, use the RAG chain (it will handle both domain and general questions)
     return "rag_query"
 
 # --- MAIN INTERACTION LOOP ---
 if __name__ == "__main__":
     print("Welcome to the AI Research Synthesizer!")
     print(f"Knowledge base loaded with {len(SOURCE_DOCUMENTS)} documents.")
-    print("Ask a question about Multi-Agent AI Systems or about the knowledge base. Type 'exit' to quit.")
-    
-    while True:
-        user_question = input("\nYour question: ")
-        if user_question.lower() == 'exit':
-            break
-        
-        route = query_router(user_question)
-        
-        if route == "meta_query":
-            answer = handle_meta_query(user_question)
-            print("Answer:", answer)
-        
-        elif route == "rag_query":
-            result = rag_chain.invoke(user_question)
-            print("Answer:", result["answer"])
-            
-            source_documents = result["documents"]
-            unique_sources = {}
-            for doc in source_documents:
-                source_file = os.path.basename(doc.metadata.get("source", "Unknown Source"))
-                display_name = doc.metadata.get("title", source_file)
-                if not display_name:
-                    display_name = source_file
-                unique_sources[source_file] = display_name
+    print("Type 'exit' to quit.")
 
-            if unique_sources:
-                print("\nSources:")
-                for display_name in sorted(unique_sources.values()):
-                    print(f"- {display_name}")
+    try:
+        while True:
+            user_question = input("\nYour question: ").strip()
+            if not user_question:
+                continue
+            if user_question.lower() == "exit":
+                break
+
+            route = query_router(user_question)
+
+            if route == "greet":
+                print("Answer:", handle_greeting(user_question))
+                continue
+
+            if route == "meta_query":
+                print("Answer:", handle_meta_query(user_question))
+                continue
+
+            answer, docs = answer_rag_question(user_question)
+            print("Answer:", answer)
+            if docs:
+                unique_sources = {}
+                for doc in docs:
+                    try:
+                        source_file = os.path.basename(doc.metadata.get("source", "Unknown"))
+                        display_name = doc.metadata.get("title", source_file) or source_file
+                        unique_sources[source_file] = display_name
+                    except Exception:
+                        continue
+                if unique_sources:
+                    print("\nSources:")
+                    for display_name in sorted(unique_sources.values()):
+                        print(f"- {display_name}")
+    except KeyboardInterrupt:
+        print("\nExiting.")
