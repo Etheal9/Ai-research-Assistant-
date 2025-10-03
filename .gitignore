@@ -20,3 +20,20 @@ papers/*.bin
 .vscode/
 .DS_Store
 Thumbs.db
+
+# Additional ignores
+.gradio/
+papers/
+data/
+outputs/
+artifacts/
+checkpoints/
+logs/
+
+# Build artifacts
+dist/
+build/
+*.egg-info/
+
+# IDE
+.idea/
